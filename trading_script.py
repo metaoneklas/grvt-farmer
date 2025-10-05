@@ -4,6 +4,7 @@ Grvt Bracket Limit Orders Bot (loop version)
 Places two limit orders with filters:
   - BUY below best ask
   - SELL above best bid
+Skips placement if any open orders exist.
 Runs in loop with configurable wait and max attempts.
 """
 
@@ -19,6 +20,15 @@ load_dotenv()
 
 # Rolling window for volatility
 price_window = deque(maxlen=50)
+
+
+def get_open_orders(api: GrvtCcxt, symbol: str) -> list[dict]:
+    open_orders: list[dict] = api.fetch_open_orders(
+        symbol=symbol,
+        params={"kind": "PERPETUAL"},
+    )
+    print(f"open_orders: {open_orders}")
+    return open_orders
 
 
 def compute_orderbook_imbalance(bids, asks, depth=5):
@@ -40,7 +50,6 @@ def place_bracket_limit_orders(
     obi_tolerance: float,
     max_volatility: float,
 ):
-
     instrument = api.markets[symbol]["instrument"]
     orderbook = api.fetch_order_book(instrument, limit=10)
 
@@ -48,7 +57,6 @@ def place_bracket_limit_orders(
     bids = orderbook.get("bids")
     if not asks or not bids:
         raise RuntimeError("Orderbook missing asks or bids")
-
 
     best_ask = float(asks[0]["price"])
     best_bid = float(bids[0]["price"])
@@ -59,13 +67,13 @@ def place_bracket_limit_orders(
 
     # --- Spread filter ---
     if not (min_spread <= spread <= max_spread):
-        print(f"⏸️ Spread fuori range ({spread:.2f}), salto ordine.")
+        print(f"⏸️ Spread out of range ({spread:.2f}), skipping order.")
         return None
 
     # --- OBI filter ---
     obi = compute_orderbook_imbalance(bids, asks)
     if obi < 0.5 - obi_tolerance or obi > 0.5 + obi_tolerance:
-        print(f"⏸️ Orderbook sbilanciato (OBI={obi:.2f}), salto ordine.")
+        print(f"⏸️ Orderbook imbalanced (OBI={obi:.2f}), skipping order.")
         return None
 
     # --- Volatility filter ---
@@ -74,8 +82,9 @@ def place_bracket_limit_orders(
         log_returns = np.diff(np.log(price_window))
         vol = np.std(log_returns)
         if vol > max_volatility:
-            print(f"⏸️ Volatilità troppo alta ({vol:.4f}), salto ordine.")
+            print(f"⏸️ Volatility too high ({vol:.4f}), skipping order.")
             return None
+
     # BUY limit below best ask
     buy_price = best_ask - offset
     sell_price = best_bid + offset
@@ -107,10 +116,8 @@ def main():
     trading_account_id = os.getenv("GRVT_TRADING_ACCOUNT_ID")
     private_key = os.getenv("GRVT_PRIVATE_KEY")
 
-
     if not all([api_key, trading_account_id, private_key]):
         raise EnvironmentError("Missing required env vars: GRVT_API_KEY, GRVT_TRADING_ACCOUNT_ID, GRVT_PRIVATE_KEY")
-
 
     params = {
         "api_key": api_key,
@@ -139,23 +146,32 @@ def main():
 
     attempt = 0
     while attempt < MAX_ATTEMPTS:
-        print(f"\nðAttempt {attempt+1}/{MAX_ATTEMPTS}")
+        print(f"\n🔁 Attempt {attempt + 1}/{MAX_ATTEMPTS}")
+
         try:
+            # 🔍 Skip if any open orders exist
+            open_orders = get_open_orders(api, SYMBOL)
+            if open_orders:
+                print(f"⚠️ {len(open_orders)} open order(s) found. Skipping new orders.")
+                time.sleep(WAIT_SECONDS)
+                continue
+
             results = place_bracket_limit_orders(
                 api, SYMBOL, QUANTITY, OFFSET,
                 MIN_SPREAD, MAX_SPREAD, OBI_TOLERANCE, MAX_VOLATILITY
             )
+
             if results:
                 print(f"✅ BUY {results['buy']['order_id']} @ {results['buy']['price']:.2f}")
                 print(f"✅ SELL {results['sell']['order_id']} @ {results['sell']['price']:.2f}")
                 attempt += 1
-                print(f"⏳ Waiting {WAIT_SECONDS} sec before next attempt...")
                 time.sleep(WAIT_SECONDS)
             else:
-                print("⚠️ Nessun ordine piazzato, ritento subito...")
-                time.sleep(5)  # retry veloce se filtrato
+                print("⚠️ Order skipped by filters. Retrying soon...")
+                time.sleep(5)
+
         except Exception as e:
-            print(f"❌ Errore: {e}")
+            print(f"❌ Error: {e}")
             time.sleep(10)
 
 
